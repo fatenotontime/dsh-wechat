@@ -572,6 +572,17 @@ class WechatRuntime {
    */
   readonly #turnAcked = new Set<string>()
   /**
+   * Sessions whose running model attempt has already reached for a tool.
+   *
+   * A turn that calls tools runs one attempt per step, and only the last attempt — the one that
+   * stops to answer instead of reaching for another tool — ends the turn. That distinction is
+   * visible in the stream itself: `start` opens one attempt and `end` closes it, so `end` alone
+   * cannot tell the final attempt from the nineteenth. `agent/turn-stopping` is a second trigger,
+   * but a reply must not depend on it alone: it is a scoped event, and a run can see it for one
+   * session and never for another.
+   */
+  readonly #attemptTool = new Set<string>()
+  /**
    * Conversations currently showing "typing…", with the timers that keep it up.
    *
    * Keyed by conversation so a second message in the same chat does not start a second refresh loop,
@@ -3536,7 +3547,36 @@ class WechatRuntime {
     // of from a second guess about field names.
     if (chunkType !== undefined) this.#recordOnce('#chunkTypes', `stream chunk kind: ${chunkType}`)
     if (frameShape !== undefined) this.#recordOnce('#frameShapes', `stream frame shape: ${frameShape}`)
-    if ((text === undefined || text === '') && completed !== true) return
+
+    /*
+     * Which attempt is running, and whether it has reached for a tool.
+     *
+     * Read here, above the early return, because the frames that carry both are exactly the ones
+     * that return early: `start` opens an attempt and has no chunk at all, and a tool-call chunk
+     * carries no user-visible text.
+     */
+    if (frameShape !== undefined && frameShape.includes('type=start')) {
+      this.#attemptTool.delete(sessionId)
+    }
+    if (chunkType !== undefined && chunkType.startsWith('tool-call')) {
+      this.#attemptTool.add(sessionId)
+    }
+
+    /*
+     * Frames that carry nothing this handler can act on.
+     *
+     * `block-end` is deliberately not one of them, even though it carries no text: it is the
+     * boundary the acknowledgement below is sent on. Returning here for it — as this guard used
+     * to — made that entire branch unreachable, so `auto` silently behaved like `quiet`, and a
+     * turn that ran long enough to matter answered with nothing at all until it ended.
+     */
+    if (
+      (text === undefined || text === '') &&
+      completed !== true &&
+      chunkType !== 'block-end'
+    ) {
+      return
+    }
 
     void (async () => {
       const bindings = (await this.#store.read()).bindings
@@ -3573,15 +3613,26 @@ class WechatRuntime {
 
       /*
        * `completed` means one model ATTEMPT closed, not that the turn did. A turn that calls tools
-       * runs one attempt per step, so sending here put a progress report on the phone for every tool
-       * call — which is what buried the answer and ate the ten-message reply window. The turn's real
-       * end is `agent/turn-stopping`, which flushes instead. Only `verbose` restores the per-step
-       * send; in the other modes this frame just re-arms the safety window below.
+       * runs one attempt per step, so sending on every one of these put a progress report on the
+       * phone for every tool call — which is what buried the answer and ate the ten-message reply
+       * window.
+       *
+       * The attempt that ends the turn is the one that did not call a tool: having nothing left to
+       * reach for is what makes the model stop. So that is the attempt whose text is the answer,
+       * and the one that releases everything withheld. `verbose` keeps the old per-step send.
        */
-      if (completed === true && progressMode === 'verbose') {
-        this.#replies.set(sessionId, entry)
-        await this.#flushReply(sessionId)
-        return
+      if (completed === true) {
+        const calledTool = this.#attemptTool.has(sessionId)
+        this.#attemptTool.delete(sessionId)
+        if (progressMode === 'verbose' || !calledTool) {
+          if (!calledTool) {
+            this.#recordBoot(`stream: turn ended on a tool-free attempt (session ${sessionId})`)
+          }
+          this.#turnAcked.delete(sessionId)
+          this.#replies.set(sessionId, entry)
+          await this.#flushReply(sessionId)
+          return
+        }
       }
 
       /*
@@ -4233,9 +4284,6 @@ export function apply(
     ctx.provide('wechatChannel', runtime)
 
     ctx.effect(() => {
-      // One boot-log line the first time a turn end is seen, so a payload that never carries a
-      // session id cannot hide behind "answers just arrive late".
-      let turnEndSeen = false
       const detachStream = ctx.on(
         'agent/assistant-stream',
         (payload) => {
@@ -4300,14 +4348,13 @@ export function apply(
           const sessionId = agent?.session?.id
           if (typeof sessionId === 'string') {
             /*
-             * Recorded once. The failure this guards against is silent: if the payload carried no
-             * session id, every withheld reply would fall through to the safety window instead, and
-             * the only symptom would be answers arriving minutes late with nothing saying why.
+             * Recorded every time, not once per boot.
+             *
+             * The first version logged a single line to keep the log small, and that is exactly what
+             * hid this bug: the event arrived for one session and never for another, and one line
+             * cannot show the difference. Turns are rare enough that one line each costs nothing.
              */
-            if (!turnEndSeen) {
-              turnEndSeen = true
-              bootLog(home, `turn-stopping: turn end reached (session ${sessionId})`)
-            }
+            bootLog(home, `turn-stopping: turn end reached (session ${sessionId})`)
             runtime.flushTurnReply(sessionId)
           } else {
             bootLog(
