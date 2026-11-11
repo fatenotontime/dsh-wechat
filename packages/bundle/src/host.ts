@@ -563,6 +563,15 @@ class WechatRuntime {
   /** Non-text messages awaiting an instruction, keyed by conversation. */
   readonly #pending = new Map<string, PendingBatch>()
   /**
+   * Sessions whose turn has already been spoken to the phone once.
+   *
+   * In `auto` the turn's first text block goes out as soon as it closes, so a long task opens with
+   * an acknowledgement instead of silence; everything after it waits for the turn to end. This
+   * marker is what keeps that from decaying back into the per-step stream, and it is cleared when
+   * the turn's output is released, so the next turn starts unmarked.
+   */
+  readonly #turnAcked = new Set<string>()
+  /**
    * Conversations currently showing "typing…", with the timers that keep it up.
    *
    * Keyed by conversation so a second message in the same chat does not start a second refresh loop,
@@ -3506,10 +3515,17 @@ class WechatRuntime {
   /**
    * Feed one assistant stream frame into the reply buffer.
    *
-   * DSH emits deltas as the model generates. Batching them behind a short quiet
-   * window turns a stream into one coherent WeChat message instead of a burst of
-   * fragments, which is what a chat transcript needs. A frame that ends the turn
-   * flushes immediately rather than waiting out the window.
+   * DSH emits deltas as the model generates. Batching them behind a quiet window turns a stream
+   * into one coherent WeChat message instead of a burst of fragments, which is what a chat
+   * transcript needs.
+   *
+   * A frame's `end` is NOT the turn's end. DSH frames one model *attempt* (`start` / `chunk` /
+   * `end` — see `SessionAssistantStreamAccumulator` in `dsh-api-session-controller`), and a turn
+   * that calls tools runs one attempt per step. Flushing on `end` therefore mailed one WeChat
+   * message per step, which buried the answer under progress reports and ate the reply window.
+   * The turn's real end arrives as `agent/turn-stopping`, which flushes immediately (see the
+   * effect in `apply`). The quiet window below is only a safety net for a turn that never stops
+   * cleanly, so it wants a long value rather than a short one.
    */
   onAssistantFrame(payload: AssistantStreamPayload): void {
     const { sessionId, text, completed, chunkType, frameShape } = readStreamFrame(payload)
@@ -3551,22 +3567,71 @@ class WechatRuntime {
       }
       if (text !== undefined) entry.text += text
 
-      if (completed === true) {
-        // The turn ended: send now, so the reply is not held behind the settle window.
+      // Read from the cache, never awaited: this handler must stay synchronous so two frames of
+      // the same answer cannot interleave and lose the first half of the reply.
+      const { settleMs, progressMode } = this.#settingsNow()
+
+      /*
+       * `completed` means one model ATTEMPT closed, not that the turn did. A turn that calls tools
+       * runs one attempt per step, so sending here put a progress report on the phone for every tool
+       * call — which is what buried the answer and ate the ten-message reply window. The turn's real
+       * end is `agent/turn-stopping`, which flushes instead. Only `verbose` restores the per-step
+       * send; in the other modes this frame just re-arms the safety window below.
+       */
+      if (completed === true && progressMode === 'verbose') {
         this.#replies.set(sessionId, entry)
         await this.#flushReply(sessionId)
         return
       }
 
-      // Read from the cache, never awaited: this handler must stay synchronous so two frames of
-      // the same answer cannot interleave and lose the first half of the reply.
-      const { settleMs } = this.#settingsNow()
+      /*
+       * The turn's first spoken block, sent immediately.
+       *
+       * Withholding everything until the turn ends means a task that runs twenty minutes answers
+       * with twenty minutes of silence, which is its own failure: from the phone, "working" and
+       * "gone" look identical. So the first text block is allowed out as soon as it closes — in
+       * practice the model's acknowledgement — and only what comes after it is withheld.
+       *
+       * The boundary is `block-end`, not the first delta: sending on a delta would put a fragment
+       * like "收" on the phone. And only `auto` does this: `quiet` is the mode that asks for the
+       * result and nothing else.
+       */
+      if (
+        progressMode === 'auto' &&
+        chunkType === 'block-end' &&
+        !this.#turnAcked.has(sessionId) &&
+        entry.text.trim() !== ''
+      ) {
+        this.#turnAcked.add(sessionId)
+        this.#replies.set(sessionId, entry)
+        await this.#flushReply(sessionId)
+        return
+      }
+
       entry.timer = setTimeout(() => {
+        // The safety window released this turn, so the next one may speak up again.
+        this.#turnAcked.delete(sessionId)
         void this.#flushReply(sessionId)
       }, settleMs)
       entry.timer.unref?.()
       this.#replies.set(sessionId, entry)
     })()
+  }
+
+  /**
+   * Send a session's buffered reply because its turn genuinely ended.
+   *
+   * Called from the `agent/turn-stopping` listener, which is the only signal that means "the turn is
+   * over" rather than "one model attempt is over". Synchronous by design: the event is dispatched on
+   * the agent's own loop, so this must neither await the store nor the network.
+   *
+   * @param sessionId - Session whose turn stopped.
+   */
+  flushTurnReply(sessionId: string): void {
+    this.#turnAcked.delete(sessionId)
+    const entry = this.#replies.get(sessionId)
+    if (entry !== undefined) clearTimeout(entry.timer)
+    void this.#flushReply(sessionId)
   }
 
   /** Send and clear the buffered reply for a session. */
@@ -4168,6 +4233,9 @@ export function apply(
     ctx.provide('wechatChannel', runtime)
 
     ctx.effect(() => {
+      // One boot-log line the first time a turn end is seen, so a payload that never carries a
+      // session id cannot hide behind "answers just arrive late".
+      let turnEndSeen = false
       const detachStream = ctx.on(
         'agent/assistant-stream',
         (payload) => {
@@ -4200,6 +4268,56 @@ export function apply(
         global: true,
         prepend: true,
       })
+      /*
+       * The turn's real end.
+       *
+       * `agent/assistant-stream`'s `end` closes one model *attempt*, so a turn that calls tools
+       * produces one per step; `agent/turn-stopping` fires once, when the turn is over. It is what
+       * releases a reply withheld from the phone, so a turn's narration and its answer arrive
+       * together and only once.
+       *
+       * `global: true` for the same reason as the waterfalls above: the event is dispatched with a
+       * scope target and this plugin owns no agent, so without the flag it is filtered out before it
+       * can run — and then no withheld reply would ever be released.
+       */
+      /*
+       * `agent/turn-stopping` is a scoped event DSH dispatches only when a turn really ends, but the
+       * host-scope event map this bundle compiles against does not declare it — the overloads carry
+       * the three events above and little else. Dispatch is name-based at runtime and keeps a hook
+       * whose `global` flag is set, so the listener is reached; only the overload set needs stepping
+       * around. A compile error here would otherwise leave a withheld reply with no way to be
+       * released at all, which is the one failure this patch must not have.
+       */
+      const onEvent = ctx.on as unknown as (
+        name: string,
+        handler: (payload: unknown) => void,
+        options?: { global?: boolean; prepend?: boolean },
+      ) => (() => void) | undefined
+      const detachTurnEnd = onEvent(
+        'agent/turn-stopping',
+        (payload) => {
+          const agent = (payload as { agent?: { session?: { id?: unknown } } } | undefined)?.agent
+          const sessionId = agent?.session?.id
+          if (typeof sessionId === 'string') {
+            /*
+             * Recorded once. The failure this guards against is silent: if the payload carried no
+             * session id, every withheld reply would fall through to the safety window instead, and
+             * the only symptom would be answers arriving minutes late with nothing saying why.
+             */
+            if (!turnEndSeen) {
+              turnEndSeen = true
+              bootLog(home, `turn-stopping: turn end reached (session ${sessionId})`)
+            }
+            runtime.flushTurnReply(sessionId)
+          } else {
+            bootLog(
+              home,
+              `turn-stopping: no session id in payload — keys ${JSON.stringify(Object.keys((payload ?? {}) as object))}`,
+            )
+          }
+        },
+        { global: true },
+      )
 
       void (async () => {
         try {
@@ -4215,6 +4333,7 @@ export function apply(
           if (typeof detachStream === 'function') detachStream()
           if (typeof detachApproval === 'function') detachApproval()
           if (typeof detachQuestions === 'function') detachQuestions()
+          if (typeof detachTurnEnd === 'function') detachTurnEnd()
           detachRoutes()
           if (typeof detachTool === 'function') detachTool()
           runtime.stopTypingAll()
@@ -4412,6 +4531,18 @@ function readSettingsPatch(body: Record<string, unknown>): ChannelSettings {
   }
   if (typeof body.allowCrossSessionNotify === 'boolean') {
     patch.allowCrossSessionNotify = body.allowCrossSessionNotify
+  }
+  /*
+   * Checked against the known values rather than passed through: a typo would otherwise be stored
+   * and then silently compared against three literals that never match, leaving the channel on the
+   * default while the page reports the value it sent.
+   */
+  if (
+    body.progressMode === 'auto' ||
+    body.progressMode === 'quiet' ||
+    body.progressMode === 'verbose'
+  ) {
+    patch.progressMode = body.progressMode
   }
   /*
    * An empty string is the reset rather than a rejected value: it is how the page clears a

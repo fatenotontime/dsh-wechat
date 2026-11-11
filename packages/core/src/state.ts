@@ -123,6 +123,22 @@ export interface ChannelSettings {
   maxReplyChars?: number
   /** Quiet time that ends a burst of assistant output into one message, in milliseconds. */
   settleMs?: number
+  /**
+   * How much of the agent's mid-turn output is allowed to reach the phone.
+   *
+   * `auto` — mid-turn narration is withheld and delivered with the answer at the end of the turn,
+   * and the agent is told to push a progress note itself (through `notify_wechat`) when it judges
+   * that the user needs one. Progress then arrives when it is worth something, rather than once per
+   * tool call.
+   *
+   * `quiet` — the same withholding, but the agent is told to stay silent until the turn ends. For a
+   * user who wants one answer and nothing else.
+   *
+   * `verbose` — the original behaviour, where each model attempt's output is sent as it completes.
+   * That is one WeChat message per step of a tool-heavy turn, which is what buries the answer and
+   * exhausts a ten-message reply window.
+   */
+  progressMode?: ProgressMode
   /** How many sent messages to retain per conversation, for resolving quotes. */
   quoteHistory?: number
   /** Whether a non-text message is answered on its own once the window elapses. */
@@ -184,11 +200,15 @@ export interface ChannelSettings {
 /** Permission presets this channel will apply to its own sessions. */
 export type PermissionPreset = 'danger-full-access' | 'auto' | 'default'
 
+/** How much of the agent's mid-turn output reaches the phone. */
+export type ProgressMode = 'auto' | 'quiet' | 'verbose'
+
 /** Values applied when a setting has never been stored. */
 export const DEFAULT_SETTINGS = {
   mergeWindowMs: 10_000,
   maxReplyChars: 4_000,
-  settleMs: 1_200,
+  settleMs: 300_000,
+  progressMode: 'auto',
   quoteHistory: 40,
   autoReplyAttachments: true,
   requireConfirmation: true,
@@ -199,7 +219,15 @@ export const DEFAULT_SETTINGS = {
     '[渠道：微信] 你在和微信上的用户对话，对方在手机上，看不到这台电脑的屏幕和文件系统。' +
     '不要让他去"打开某个路径"或"看某个文件"。需要给他看东西时，直接发送：' +
     '图片或视频会显示成照片/视频，其他文件会作为附件发过去。' +
-    '回复尽量简短，适合手机阅读。',
+    '回复尽量简短，适合手机阅读。' +
+    '【汇报方式】工具调用之间的普通叙述不会立刻发到用户手机，别用它汇报进度。' +
+    '要主动汇报就用 notify_wechat 工具，它一调用立刻送达。用法：' +
+    '开工时先发一条确认（例如"收到，我先看 X"）——任务预计超过一两分钟就一定要发；' +
+    '任务分阶段或要跑很久时，每隔一段发一条短进度（例如"第 3/9 步：正在跑测试"）；' +
+    '有重要发现、改了方案、或卡住需要他决定时，立刻发；' +
+    '全部做完后给出完整结论。' +
+    '一次任务总共控制在 6 条以内（每次入站只有 10 条回复额度，超了就发不出去）。' +
+    '一两步就能做完的小任务不要发中间消息，直接给结果。',
 } as const
 
 /**
@@ -214,6 +242,7 @@ export function resolveSettings(state: ChannelState): Required<ChannelSettings> 
     mergeWindowMs: stored.mergeWindowMs ?? DEFAULT_SETTINGS.mergeWindowMs,
     maxReplyChars: stored.maxReplyChars ?? DEFAULT_SETTINGS.maxReplyChars,
     settleMs: stored.settleMs ?? DEFAULT_SETTINGS.settleMs,
+    progressMode: stored.progressMode ?? DEFAULT_SETTINGS.progressMode,
     quoteHistory: stored.quoteHistory ?? DEFAULT_SETTINGS.quoteHistory,
     autoReplyAttachments:
       stored.autoReplyAttachments ?? DEFAULT_SETTINGS.autoReplyAttachments,
@@ -843,6 +872,7 @@ const SETTING_VALIDATORS: {
   maxReplyChars: (raw) => (typeof raw === 'number' && Number.isFinite(raw) && raw >= 0 ? raw : undefined),
   settleMs: (raw) => (typeof raw === 'number' && Number.isFinite(raw) && raw >= 0 ? raw : undefined),
   quoteHistory: (raw) => (typeof raw === 'number' && Number.isFinite(raw) && raw >= 0 ? raw : undefined),
+  progressMode: (raw) => (raw === 'auto' || raw === 'quiet' || raw === 'verbose' ? raw : undefined),
   autoReplyAttachments: (raw) => (typeof raw === 'boolean' ? raw : undefined),
   requireConfirmation: (raw) => (typeof raw === 'boolean' ? raw : undefined),
   presenceNote: (raw) => (typeof raw === 'string' ? raw : undefined),
