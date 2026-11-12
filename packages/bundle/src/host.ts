@@ -3631,6 +3631,12 @@ class WechatRuntime {
     if (frameShape !== undefined) this.#recordOnce('#frameShapes', `stream frame shape: ${frameShape}`)
 
     /*
+     * Read from the cache, never awaited: this handler must stay synchronous so two frames of
+     * the same answer cannot interleave and lose the first half of the reply.
+     */
+    const { settleMs, progressMode } = this.#settingsNow()
+
+    /*
      * Which attempt is running, and whether it has reached for a tool.
      *
      * Read here, above the early return, because the frames that carry both are exactly the ones
@@ -3639,6 +3645,23 @@ class WechatRuntime {
      */
     if (frameShape !== undefined && frameShape.includes('type=start')) {
       this.#attemptTool.delete(sessionId)
+      /*
+       * A new attempt replaces whatever the last one was saying.
+       *
+       * An attempt that reaches for a tool is a step on the way, and the text it wrote is a report
+       * on that step — "I found the file, now I'll read it". Keeping it and releasing it with the
+       * answer at the end of the turn is not withholding it at all: the user gets one long message
+       * that opens with the narration they asked not to receive, and the answer is buried in it.
+       * Dropping it here is what makes the withholding real. `verbose` keeps everything, because
+       * that mode exists to show the process.
+       *
+       * The turn's first block is untouched by this: it is sent the moment it closes, before any
+       * later attempt can clear the buffer.
+       */
+      if (progressMode !== 'verbose') {
+        const live = this.#replies.get(sessionId)
+        if (live !== undefined) live.text = ''
+      }
     }
     if (chunkType !== undefined && chunkType.startsWith('tool-call')) {
       this.#attemptTool.add(sessionId)
@@ -3689,9 +3712,7 @@ class WechatRuntime {
       }
       if (text !== undefined) entry.text += text
 
-      // Read from the cache, never awaited: this handler must stay synchronous so two frames of
-      // the same answer cannot interleave and lose the first half of the reply.
-      const { settleMs, progressMode } = this.#settingsNow()
+      // `settleMs` and `progressMode` were read above, before the attempt bookkeeping.
 
       /*
        * `completed` means one model ATTEMPT closed, not that the turn did. A turn that calls tools
