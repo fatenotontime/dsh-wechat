@@ -2562,6 +2562,24 @@ class WechatRuntime {
   }
 
   /**
+   * Record a refusal, once per closed window.
+   *
+   * A closed window stays closed until the user writes, so every send in between is refused with the
+   * same text. Logging each one would bury everything else; logging none left the reason for a failed
+   * push nowhere at all, and the reason is the whole question — a stale session and a real rate limit
+   * differ in `errmsg`, not in the code they share.
+   *
+   * @param conversationId - Conversation the send was for.
+   * @param message - The service's refusal reason.
+   */
+  #noteRefusal(conversationId: string, message: string): void {
+    const key = `${conversationId}\u0000${message}`
+    if (this.#lastRefusal === key) return
+    this.#lastRefusal = key
+    this.#recordBoot(`补发被拒: ${message}`)
+  }
+
+  /**
    * Deliver anything queued for this conversation, now that its window is open again.
    *
    * Called as soon as an inbound message refreshes the reply token, and before that message is
@@ -2593,7 +2611,80 @@ class WechatRuntime {
 
       let sent = 0
       const unsendable: string[] = []
-      for (const entry of mine) {
+
+      /*
+       * The backlog goes out as one message, not as one message per entry.
+       *
+       * Replaying it entry by entry was worse than useless. The platform allows ten sends per
+       * window, and a closed window is what built the backlog in the first place — so nine queued
+       * progress reports spent nine of the ten slots the user's next message had just opened. The
+       * dump closed the window it had been given, everything after the tenth was refused and
+       * queued again, and the reports arrived as a burst hours late with the one that mattered
+       * somewhere in the middle. One message costs one slot and reads as one thing.
+       *
+       * Newest first: when the budget cannot hold everything, the report that still describes the
+       * present is worth more than the ones it supersedes.
+       */
+      const texts = mine.filter((entry) => entry.path === undefined)
+      const withFiles = mine.filter((entry) => entry.path !== undefined)
+
+      if (texts.length > 0) {
+        const header =
+          texts.length === 1
+            ? ''
+            : `📬 你不在的时候积压了 ${String(texts.length)} 条消息，合并成一条：\n\n`
+        const budget = Math.max(0, this.#settingsNow().maxReplyChars - header.length - 64)
+        const kept: string[] = []
+        let used = 0
+        for (const entry of [...texts].reverse()) {
+          const body = entry.text.trim()
+          if (body === '') continue
+          if (used + body.length > budget) break
+          kept.unshift(body)
+          used += body.length
+        }
+
+        if (kept.length === 0) {
+          // Nothing here is worth a slot; retrying pure noise forever would block the queue.
+          for (const entry of texts) await this.#dropPending(entry.id)
+        } else {
+          const omitted = texts.length - kept.length
+          const text =
+            header +
+            kept.join('\n\n') +
+            (omitted > 0 ? `\n\n（另有 ${String(omitted)} 条更早的已省略）` : '')
+          try {
+            await this.#sendText(
+              target.account,
+              target.conversationId,
+              target.peerId,
+              text,
+              target.contextToken,
+            )
+            this.#lastRefusal = ''
+            for (const entry of texts) await this.#dropPending(entry.id)
+            sent += 1
+          } catch (error) {
+            if (error instanceof SendRefusedError) {
+              // Kept, all of them: the whole entry set went out as one message, so a refusal leaves
+              // the backlog exactly as it was.
+              this.#noteRefusal(conversationId, error.message)
+            } else {
+              this.#recordError(
+                `补发失败：${error instanceof Error ? error.message : String(error)}`,
+              )
+              for (const entry of texts) await this.#dropPending(entry.id)
+            }
+          }
+        }
+      }
+
+      /*
+       * Files keep the per-entry path: they carry no text worth merging, and a queued file is an
+       * answer someone asked for. They are also the reason this loop cannot simply batch everything
+       * into one send, since `#sendText` cannot carry an attachment.
+       */
+      for (const entry of withFiles) {
         try {
           if (entry.text.trim() !== '') {
             await this.#sendText(
@@ -2614,6 +2705,7 @@ class WechatRuntime {
             }
             await this.#conveyFile(entry.path, undefined, target)
           }
+          this.#lastRefusal = ''
           sent += 1
           await this.#dropPending(entry.id)
         } catch (error) {
@@ -2621,17 +2713,7 @@ class WechatRuntime {
           // possible; keeping the entry is the whole point of the queue. Anything else cannot succeed
           // on a later attempt either, so it is reported and dropped rather than retried forever.
           if (error instanceof SendRefusedError) {
-            /*
-             * Recorded here as well as in `#sendOrQueue`, because this loop sends directly and would
-             * otherwise be the one place a refusal leaves no trace at all. That is exactly how the
-             * tenth-and-later message of a burst disappeared: the first ten went out, the rest were
-             * refused, and the log showed a successful flush of ten with nothing about the others.
-             */
-            const key = `${conversationId}\u0000${error.message}`
-            if (this.#lastRefusal !== key) {
-              this.#lastRefusal = key
-              this.#recordBoot(`补发被拒: ${error.message}`)
-            }
+            this.#noteRefusal(conversationId, error.message)
           } else {
             this.#recordError(
               `补发失败：${error instanceof Error ? error.message : String(error)}`,
